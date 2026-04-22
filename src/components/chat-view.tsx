@@ -90,6 +90,75 @@ function createChatSessionKey(agentId: string) {
   return `agent:${agentId}:mission-control:${suffix}`;
 }
 
+// ── Per-agent localStorage persistence ─────────────
+const CHAT_SESSION_LS = (id: string) => `openclaw-session:${id}`;
+const CHAT_MSGS_LS = (id: string) => `openclaw-msgs:${id}`;
+const CHAT_MSGS_MAX = 100;
+const CHAT_MSG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function loadStoredSessionKey(agentId: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const s = localStorage.getItem(CHAT_SESSION_LS(agentId));
+    if (s && s.startsWith(`agent:${agentId}:mission-control:`)) return s;
+  } catch { /* localStorage unavailable */ }
+  const k = createChatSessionKey(agentId);
+  try { localStorage.setItem(CHAT_SESSION_LS(agentId), k); } catch { /* ignore */ }
+  return k;
+}
+
+// Current stored-message format version. Bump when the shape changes incompatibly.
+const CHAT_MSGS_VERSION = 2;
+
+/**
+ * Strip file parts from a stored message's parts array.
+ * File attachments (images, docs) are data-URL blobs that become large in
+ * localStorage and can produce malformed payloads when replayed as history.
+ * We keep text parts so conversation context survives; the binary data doesn't.
+ */
+function sanitizeParts(parts: unknown[]): unknown[] {
+  return parts.filter(
+    (p) => p && typeof p === "object" && (p as Record<string, unknown>).type !== "file"
+  );
+}
+
+function loadStoredMessages(agentId: string): unknown[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(CHAT_MSGS_LS(agentId));
+    if (!raw) return [];
+    const stored = JSON.parse(raw) as { v?: number; msgs?: unknown[] } | unknown[];
+    // Support both versioned { v, msgs } and legacy plain-array shapes
+    const arr: unknown[] = Array.isArray(stored)
+      ? stored
+      : Array.isArray((stored as { msgs?: unknown[] }).msgs)
+        ? (stored as { msgs: unknown[] }).msgs
+        : [];
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+    const cutoff = Date.now() - CHAT_MSG_TTL_MS;
+    const sanitized = arr
+      .filter((m) => {
+        if (!m || typeof m !== "object") return false;
+        const msg = m as Record<string, unknown>;
+        if (!msg.createdAt) return true;
+        const t = typeof msg.createdAt === "string" ? Date.parse(msg.createdAt) : Number(msg.createdAt);
+        return isNaN(t) || t > cutoff;
+      })
+      .slice(-CHAT_MSGS_MAX)
+      .map((m) => {
+        const msg = { ...(m as Record<string, unknown>) };
+        // Strip file/image parts — data URLs are large and can cause gateway rejections
+        // when replayed as multi-turn history. Text parts are preserved.
+        if (Array.isArray(msg.parts)) {
+          msg.parts = sanitizeParts(msg.parts as unknown[]);
+        }
+        msg.createdAt = msg.createdAt ? new Date(msg.createdAt as string | number) : undefined;
+        return msg;
+      });
+    return sanitized;
+  } catch { return []; }
+}
+
 /** Convert File[] to FileUIPart[] (data URLs) for sendMessage */
 async function filesToUIParts(files: File[]): Promise<Array<{ type: "file"; mediaType: string; filename?: string; url: string }>> {
   return Promise.all(
@@ -443,6 +512,7 @@ function ChatPanel({
   modelsLoaded,
   isPostOnboarding,
   onClearPostOnboarding,
+  onRegisterClear,
 }: {
   agentId: string;
   agentName: string;
@@ -455,6 +525,7 @@ function ChatPanel({
   modelsLoaded: boolean;
   isPostOnboarding: boolean;
   onClearPostOnboarding: () => void;
+  onRegisterClear: (fn: () => void) => void;
 }) {
   const postOnboardingStarterPrompt = "Say hello and tell me how you can help me today.";
   const timeFormat = useSyncExternalStore(
@@ -465,9 +536,10 @@ function ChatPanel({
   const [inputValue, setInputValue] = useState(() =>
     isPostOnboarding && isSelected ? postOnboardingStarterPrompt : ""
   );
-  const chatSessionKeyRef = useRef(
-    typeof window === "undefined" ? "" : createChatSessionKey(agentId)
-  );
+  const chatSessionKeyRef = useRef(loadStoredSessionKey(agentId));
+  // Load prior messages once on mount so navigation away and back restores history.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [initialMessages] = useState<any[]>(() => loadStoredMessages(agentId));
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -485,6 +557,7 @@ function ChatPanel({
     if (existing) return existing;
     const next = createChatSessionKey(agentId);
     chatSessionKeyRef.current = next;
+    try { localStorage.setItem(CHAT_SESSION_LS(agentId), next); } catch { /* ignore */ }
     return next;
   }, [agentId]);
 
@@ -521,11 +594,98 @@ function ChatPanel({
     []
   );
 
-  const { messages, sendMessage, status, setMessages, error } = useChat({
+  const { messages, sendMessage, status, setMessages, error, stop, clearError } = useChat({
     transport,
+    messages: initialMessages,
   });
 
+  // Persist messages to localStorage so nav away and back restores history.
+  // File parts are stripped before storage — data URLs are large and cause
+  // gateway rejections when replayed as history context.
+  useEffect(() => {
+    if (messages.length === 0) return;
+    try {
+      const toStore = messages.slice(-CHAT_MSGS_MAX).map((m) => {
+        const msg = { ...m } as Record<string, unknown>;
+        if (Array.isArray(msg.parts)) {
+          msg.parts = sanitizeParts(msg.parts as unknown[]);
+        }
+        return msg;
+      });
+      localStorage.setItem(CHAT_MSGS_LS(agentId), JSON.stringify({ v: CHAT_MSGS_VERSION, msgs: toStore }));
+    } catch { /* localStorage full or unavailable */ }
+  }, [messages, agentId]);
+
   const isLoading = status === "submitted" || status === "streaming";
+
+  // Mirror isLoading in a ref so visibility-change callbacks see current value
+  // without needing to re-register the event listener on every render.
+  const isLoadingRef = useRef(isLoading);
+  useEffect(() => { isLoadingRef.current = isLoading; }, [isLoading]);
+
+  // Show a manual "Recover" button if still loading after 3 minutes.
+  // GPT-5.4 reasoning can take 60-120s; 3 min means the stream is almost
+  // certainly stuck/dropped.
+  const [showRecoverButton, setShowRecoverButton] = useState(false);
+  useEffect(() => {
+    if (!isLoading) { setShowRecoverButton(false); return; }
+    const t = setTimeout(() => { if (isLoadingRef.current) setShowRecoverButton(true); }, 3 * 60 * 1000);
+    return () => clearTimeout(t);
+  }, [isLoading]);
+
+  // Fetch the last completed assistant message from the gateway session file.
+  // The gateway persists every response to disk even if the SSE stream was
+  // dropped by the browser — so this lets us recover after a tab switch.
+  const recoverLastResponse = useCallback(async () => {
+    const sessionKey = chatSessionKeyRef.current;
+    if (!sessionKey || !isLoadingRef.current) return;
+    try {
+      const res = await fetch(
+        `/api/chat/last-response?agentId=${encodeURIComponent(agentId)}&sessionKey=${encodeURIComponent(sessionKey)}`,
+      );
+      if (!res.ok) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data = await res.json() as { text: string };
+      if (!data.text) return;
+
+      // Abort the in-flight stream, then inject the recovered message.
+      stop();
+      await new Promise<void>((r) => setTimeout(r, 200));
+      clearError();
+
+      const recovered = {
+        id: crypto.randomUUID(),
+        role: "assistant" as const,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        parts: [{ type: "text" as const, text: data.text }] as any[],
+        createdAt: new Date(),
+      };
+
+      // Drop a trailing empty/partial assistant message if present, then append.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cur = messages as any[];
+      const last = cur[cur.length - 1];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hasText = (m: any) => Array.isArray(m?.parts) && m.parts.some((p: any) => p.type === "text" && p.text?.trim());
+      const base = last?.role === "assistant" && !hasText(last) ? cur.slice(0, -1) : cur;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setMessages([...base, recovered] as any);
+      setShowRecoverButton(false);
+    } catch { /* recovery failed silently */ }
+  }, [agentId, messages, stop, clearError, setMessages]);
+
+  // Auto-recover when the tab becomes visible and a request was in-flight.
+  // Chrome throttles/drops SSE connections in backgrounded tabs; the gateway
+  // already has the completed response on disk by the time the user returns.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && isLoadingRef.current) {
+        void recoverLastResponse();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [recoverLastResponse]);
   const noApiKeys = modelsLoaded && availableModels.length === 0;
 
   // ── Detect new assistant messages → trigger unread notification ──
@@ -630,9 +790,19 @@ function ChatPanel({
   const clearChat = useCallback(() => {
     setMessages([]);
     prevMsgCountRef.current = 0;
-    chatSessionKeyRef.current = createChatSessionKey(agentId);
+    const newKey = createChatSessionKey(agentId);
+    chatSessionKeyRef.current = newKey;
+    try {
+      localStorage.setItem(CHAT_SESSION_LS(agentId), newKey);
+      localStorage.removeItem(CHAT_MSGS_LS(agentId));
+    } catch { /* ignore */ }
     setTimeout(() => inputRef.current?.focus(), 100);
   }, [agentId, setMessages]);
+
+  // Register clearChat with the parent so the header can invoke it.
+  useEffect(() => {
+    onRegisterClear(clearChat);
+  }, [clearChat, onRegisterClear]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -843,6 +1013,21 @@ function ChatPanel({
                 </div>
               );
             })}
+
+            {/* Stale-stream recovery banner — shown when loading >3 min with no completion */}
+            {isLoading && showRecoverButton && (
+              <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
+                <span className="text-amber-400/80">Still waiting for a response&hellip;</span>
+                <button
+                  type="button"
+                  onClick={() => void recoverLastResponse()}
+                  className="ml-auto flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs text-amber-400 transition-colors hover:bg-amber-500/20"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Recover last response
+                </button>
+              </div>
+            )}
 
             {/* Loading indicator — only when waiting for first token, not during streaming */}
             {status === "submitted" && (
@@ -1132,6 +1317,8 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
   const [mountedAgents, setMountedAgents] = useState<Set<string>>(
     new Set(["main"])
   );
+  // Holds clearChat callbacks registered by each mounted ChatPanel
+  const clearChatFnsRef = useRef(new Map<string, () => void>());
 
   // Fetch chat bootstrap data on mount (gateway config + sessions only)
   const bootstrapLoadedRef = useRef(false);
@@ -1254,14 +1441,30 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
       <div className="shrink-0 border-b border-stone-200 bg-stone-50 px-4 py-3 md:px-6 dark:border-stone-700 dark:bg-stone-900">
         <div className="flex items-center gap-2.5">
           <span className="text-sm">{currentAgent?.emoji || "🤖"}</span>
-          <span className="text-sm font-medium text-stone-700 dark:text-stone-200">
-            {currentAgentTitle}
-          </span>
-          {showSecondaryModelLabel && (
-            <span className="text-xs text-muted-foreground">
-              {currentAgentModelLabel}
+          <div className="flex flex-col min-w-0 flex-1">
+            <span className="text-sm font-medium text-stone-700 dark:text-stone-200">
+              {currentAgentTitle}
+              {currentAgent && currentAgent.id !== currentAgentTitle && (
+                <span className="ml-1.5 text-xs font-normal text-muted-foreground/60">
+                  ({currentAgent.id})
+                </span>
+              )}
             </span>
-          )}
+            {currentAgentModelLabel && (
+              <span className="text-[10px] text-muted-foreground/70 leading-tight">
+                {currentAgentModelLabel}
+              </span>
+            )}
+          </div>
+          {/* Clear conversation — always reachable from header as an escape hatch */}
+          <button
+            type="button"
+            title="Clear conversation"
+            onClick={() => clearChatFnsRef.current.get(selectedAgent)?.()}
+            className="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground/40 transition-colors hover:bg-muted hover:text-foreground/70"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
 
@@ -1362,6 +1565,7 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
               modelsLoaded={modelsLoaded}
               isPostOnboarding={isPostOnboarding}
               onClearPostOnboarding={clearPostOnboarding}
+              onRegisterClear={(fn) => clearChatFnsRef.current.set(agentId, fn)}
             />
           );
         })

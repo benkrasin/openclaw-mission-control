@@ -1,6 +1,8 @@
 import { runOpenResponsesText, guessMime } from "@/lib/openresponses";
-import { getGatewayUrl, getGatewayToken } from "@/lib/paths";
+import { getGatewayUrl, getGatewayToken, getOpenClawHome } from "@/lib/paths";
 import { waitForResponsesEndpoint, triggerResponsesEndpointSetup } from "@/app/api/gateway/route";
+import fs from "fs";
+import path from "path";
 
 /**
  * Chat endpoint that sends a message to an OpenClaw agent and returns the response.
@@ -53,53 +55,89 @@ function normalizeRequestedSessionKey(raw: unknown): string | undefined {
 }
 
 
+function buildUserTurnItems(msg: Message): { textParts: string[]; fileParts: string[]; orContent: unknown[] } {
+  const textParts: string[] = [];
+  const fileParts: string[] = [];
+  const orContent: unknown[] = [];
+
+  if (msg.parts) {
+    for (const p of msg.parts) {
+      if (p.type === "text" && p.text) {
+        textParts.push(p.text);
+        orContent.push({ type: "text", text: p.text });
+      } else if (p.type === "file" && p.url) {
+        const name = (p.filename || "file").replace(/\s+/g, " ");
+        fileParts.push(dataUrlToSafeMessagePart(p.url, name));
+        const mime = p.mimeType || guessMime(p.url, p.filename);
+        if (mime.startsWith("image/")) {
+          // OpenAI Responses API: image_url is a plain string (data URL or https URL)
+          orContent.push({ type: "input_image", image_url: p.url });
+        } else {
+          const base64Match = p.url.match(/^data:[^;]+;base64,(.+)$/);
+          if (base64Match) {
+            orContent.push({ type: "text", text: `[Attached file: ${name}]` });
+          }
+        }
+      }
+    }
+  } else if (msg.content) {
+    textParts.push(msg.content);
+    orContent.push({ type: "text", text: msg.content });
+  }
+
+  return { textParts, fileParts, orContent };
+}
+
 function extractContent(messages: Message[]): {
   plainText: string;
   openResponsesInput: unknown;
 } {
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-  const textParts: string[] = [];
-  const fileParts: string[] = [];
-  const orItems: unknown[] = [];
 
-  if (lastUserMsg?.parts) {
-    for (const p of lastUserMsg.parts) {
-      if (p.type === "text" && p.text) {
-        textParts.push(p.text);
-        orItems.push({ type: "message", role: "user", content: p.text });
-      } else if (p.type === "file" && p.url) {
-        const name = (p.filename || "file").replace(/\s+/g, " ");
-        fileParts.push(dataUrlToSafeMessagePart(p.url, name));
-
-        // Build native OpenResponses input items for files
-        const mime = p.mimeType || guessMime(p.url, p.filename);
-        if (mime.startsWith("image/")) {
-          orItems.push({ type: "input_image", source: { type: "url", url: p.url } });
-        } else {
-          const base64Match = p.url.match(/^data:[^;]+;base64,(.+)$/);
-          if (base64Match) {
-            orItems.push({
-              type: "input_file",
-              source: { type: "base64", media_type: mime, data: base64Match[1], filename: name },
-            });
-          }
-        }
-      }
-    }
-  } else if (lastUserMsg?.content) {
-    textParts.push(lastUserMsg.content);
-    orItems.push({ type: "message", role: "user", content: lastUserMsg.content });
-  }
-
-  const textBlock = textParts.join("").trim();
-  const fileBlock = fileParts.length ? "\n\n" + fileParts.join("\n\n---\n\n") : "";
+  // plainText is always derived from the last user message (for empty-check)
+  const lastTurn = lastUserMsg ? buildUserTurnItems(lastUserMsg) : { textParts: [], fileParts: [], orContent: [] };
+  const textBlock = lastTurn.textParts.join("").trim();
+  const fileBlock = lastTurn.fileParts.length ? "\n\n" + lastTurn.fileParts.join("\n\n---\n\n") : "";
   const plainText = (textBlock + fileBlock).trim();
 
-  // Flatten simple text-only to a plain string
+  // For multi-turn conversations, build the full history so the model has context
+  // even when the gateway session is cold (e.g. first load or after clearChat).
+  const conversationTurns = messages.filter(
+    (m) => m.role === "user" || m.role === "assistant"
+  );
+
+  const orItems: unknown[] = [];
+  for (const msg of conversationTurns) {
+    if (msg.role === "assistant") {
+      const text =
+        msg.parts
+          ?.filter((p) => p.type === "text")
+          .map((p) => p.text ?? "")
+          .join("") || msg.content || "";
+      if (text.trim()) {
+        orItems.push({ type: "message", role: "assistant", content: text.trim() });
+      }
+      continue;
+    }
+    // user turn
+    const { orContent } = buildUserTurnItems(msg);
+    if (orContent.length === 0) continue;
+    const content =
+      orContent.length === 1 && (orContent[0] as { type: string }).type === "text"
+        ? (orContent[0] as { type: string; text: string }).text
+        : orContent;
+    orItems.push({ type: "message", role: "user", content });
+  }
+
+  // Single text-only turn → plain string (gateway accepts both forms)
   const openResponsesInput =
-    orItems.length === 1 && (orItems[0] as { type: string }).type === "message"
+    orItems.length === 1 &&
+    (orItems[0] as { type: string; role: string; content: unknown }).role === "user" &&
+    typeof (orItems[0] as { content: unknown }).content === "string"
       ? (orItems[0] as { content: string }).content
-      : orItems;
+      : orItems.length > 0
+        ? orItems
+        : plainText;
 
   return { plainText, openResponsesInput };
 }
@@ -124,11 +162,16 @@ function toolDisplayName(name: string): string {
  */
 async function* parseOpenResponsesStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
+  opts?: { onSpawn?: (agentId: string) => void },
 ): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   // Track in-flight tool calls so we can emit start/end markers
   const activeCalls = new Map<string, string>(); // callId → toolName
+  // Track stream state for commentary-fallback detection
+  let accumulatedDeltaText = "";
+  let finalDoneText: string | null = null;
+  let completedStatus: string | null = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -145,14 +188,39 @@ async function* parseOpenResponsesStream(
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const data = line.slice(6);
-      if (data === "[DONE]") return;
+      if (data === "[DONE]") {
+        // Before returning: if the response failed but we streamed real text,
+        // the commentary content is already in the client's buffer. Add a
+        // subtle note so the user knows the primary model was unavailable.
+        if (
+          completedStatus === "failed" &&
+          accumulatedDeltaText.trim() &&
+          (finalDoneText === "No response from OpenClaw." || !finalDoneText)
+        ) {
+          yield "\n\n*[⚡ via fallback model — primary unavailable]*";
+        }
+        return;
+      }
 
       try {
         const event = JSON.parse(data);
 
-        // ── Text deltas (existing) ──
+        // ── Text deltas ──
         if (event.type === "response.output_text.delta" && event.delta) {
+          accumulatedDeltaText += event.delta;
           yield event.delta;
+          continue;
+        }
+
+        // ── Track final done text (to detect "No response from OpenClaw." override) ──
+        if (event.type === "response.output_text.done") {
+          finalDoneText = typeof event.text === "string" ? event.text : null;
+          continue;
+        }
+
+        // ── Track overall completion status ──
+        if (event.type === "response.completed") {
+          completedStatus = event.response?.status ?? null;
           continue;
         }
 
@@ -195,6 +263,7 @@ async function* parseOpenResponsesStream(
         if (event.type === "response.function_call_arguments.done") {
           const callId = event.call_id || "";
           if (callId && activeCalls.has(callId)) {
+            const callName = activeCalls.get(callId);
             try {
               const args = typeof event.arguments === "string"
                 ? event.arguments
@@ -202,6 +271,13 @@ async function* parseOpenResponsesStream(
               // Emit args as a detail line inside the tool block
               if (args && args !== "{}") {
                 yield `\n\u{200B}[[TOOL_ARGS:${callId}:${args}]]\u{200B}\n`;
+              }
+              // Capture sessions_spawn agentId for auto-relay
+              if (callName === "sessions_spawn" && opts?.onSpawn) {
+                try {
+                  const parsed = JSON.parse(args) as { agentId?: string };
+                  if (parsed.agentId) opts.onSpawn(parsed.agentId);
+                } catch { /* ignore malformed args */ }
               }
             } catch { /* skip malformed args */ }
           }
@@ -235,6 +311,227 @@ async function* parseOpenResponsesStream(
         }
       }
     }
+  }
+}
+
+// ── Sub-agent auto-relay helpers ─────────────────────
+
+type SubagentSessionRecord = {
+  startedAt?: number;
+  endedAt?: number;
+  sessionFile?: string;
+};
+
+/**
+ * Scan all sub-agent directories for a session started during this request.
+ * sessions_spawn is handled internally by the gateway and never appears in
+ * the SSE stream, so we must scan after the orchestrator stream ends.
+ *
+ * Strategy:
+ *  - Check immediately: by the time Em's stream ends, the sub-agent is
+ *    typically already created (the spawn happens mid-run).
+ *  - If found but still running, poll up to 90s for completion.
+ *  - If not found on first pass, wait 3s and try once more, then bail.
+ *    (Avoids a long scan on requests with no delegation.)
+ */
+async function findAnySubagentResult(
+  orchAgentId: string,
+  requestStartTime: number,
+): Promise<{ agentId: string; text: string } | null> {
+  const agentsDir = path.join(getOpenClawHome(), "agents");
+  let agentIds: string[];
+  try {
+    agentIds = fs
+      .readdirSync(agentsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name !== orchAgentId)
+      .map((e) => e.name);
+  } catch {
+    return null;
+  }
+  if (agentIds.length === 0) return null;
+
+  const scanForSession = (): { id: string; sessionFile: string; done: boolean } | null => {
+    for (const id of agentIds) {
+      const p = path.join(agentsDir, id, "sessions", "sessions.json");
+      try {
+        const raw = fs.readFileSync(p, "utf-8");
+        const sessions = JSON.parse(raw) as Record<string, SubagentSessionRecord>;
+        const candidates = Object.values(sessions)
+          .filter((s) => s.startedAt && s.startedAt > requestStartTime - 5_000 && s.sessionFile)
+          .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+        if (candidates[0]) {
+          return { id, sessionFile: candidates[0].sessionFile!, done: !!candidates[0].endedAt };
+        }
+      } catch { /* not readable */ }
+    }
+    return null;
+  };
+
+  // First immediate scan — sub-agent is usually already created by now.
+  let found = scanForSession();
+
+  // If not found, give it one more short window (3s) then bail.
+  if (!found) {
+    await delay(3000);
+    found = scanForSession();
+    if (!found) return null;
+  }
+
+  // Sub-agent was found. If already done, return immediately.
+  if (found.done) {
+    const text = readSubagentSessionText(found.sessionFile);
+    if (text) return { agentId: found.id, text };
+  }
+
+  // Otherwise poll up to 90s for completion.
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    await delay(2000);
+    const p = path.join(agentsDir, found.id, "sessions", "sessions.json");
+    try {
+      const raw = fs.readFileSync(p, "utf-8");
+      const sessions = JSON.parse(raw) as Record<string, SubagentSessionRecord>;
+      const candidates = Object.values(sessions)
+        .filter((s) => s.startedAt && s.startedAt > requestStartTime - 5_000 && s.sessionFile && s.endedAt)
+        .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+      if (candidates[0]?.sessionFile) {
+        const text = readSubagentSessionText(candidates[0].sessionFile);
+        if (text) return { agentId: found.id, text };
+      }
+    } catch { /* not readable */ }
+  }
+  return null;
+}
+
+
+/**
+ * Poll ~/.openclaw/agents/{agentId}/sessions/sessions.json until a session
+ * started after `requestStartTime` finishes, then return its final assistant
+ * message text.  Returns null on timeout.
+ */
+async function pollForSubagentResult(
+  spawnedAgentId: string,
+  requestStartTime: number,
+  timeoutMs = 90_000,
+): Promise<string | null> {
+  const sessionsJsonPath = path.join(
+    getOpenClawHome(),
+    "agents",
+    spawnedAgentId,
+    "sessions",
+    "sessions.json",
+  );
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    await delay(2000);
+    try {
+      const raw = fs.readFileSync(sessionsJsonPath, "utf-8");
+      const sessions = JSON.parse(raw) as Record<string, SubagentSessionRecord>;
+      const candidates = Object.values(sessions)
+        .filter((s) => s.startedAt && s.startedAt > requestStartTime - 5_000 && s.sessionFile && s.endedAt)
+        .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+      for (const session of candidates) {
+        if (!session.sessionFile) continue;
+        const text = readSubagentSessionText(session.sessionFile);
+        if (text) return text;
+      }
+    } catch { /* sessions.json not readable */ }
+  }
+
+  return null;
+}
+
+function readSubagentSessionText(sessionFile: string): string | null {
+  try {
+    const lines = fs.readFileSync(sessionFile, "utf-8").split("\n").filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const event = JSON.parse(lines[i]) as { type: string; message?: { role: string; content: unknown } };
+        if (event.type !== "message" || event.message?.role !== "assistant") continue;
+        const content = event.message.content;
+        let text = "";
+        if (Array.isArray(content)) {
+          text = (content as Array<{ type: string; text?: string }>)
+            .filter((c) => c.type === "text" || c.type === "output_text")
+            .map((c) => c.text ?? "")
+            .join("");
+        } else if (typeof content === "string") {
+          text = content;
+        }
+        if (text.trim()) return text.trim();
+      } catch { /* skip malformed line */ }
+    }
+  } catch { /* session file not readable */ }
+  return null;
+}
+
+
+/**
+ * After Em's first stream completes, poll for a sub-agent result then fire a
+ * second Em turn and pipe its response into the already-open stream controller.
+ *
+ * sessions_spawn is handled internally by the gateway (not exposed in SSE),
+ * so we always scan sub-agent directories after the orchestrator stream ends.
+ * The scan is fast: sub-agent sessions are typically already created by then.
+ */
+async function autoRelaySubagentResult(
+  ctrl: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  opts: {
+    spawnedAgentId: string | null; // from SSE stream if available (otherwise null)
+    requestStartTime: number;
+    orchAgentId: string;
+    sessionKey: string | undefined;
+    gwUrl: string;
+    token: string;
+    gwHeaders: Record<string, string>;
+  },
+): Promise<void> {
+  const { spawnedAgentId, requestStartTime, orchAgentId, sessionKey, gwUrl, token, gwHeaders } = opts;
+
+  let result: string | null = null;
+  let resolvedAgentId = spawnedAgentId ?? "sub-agent";
+
+  if (spawnedAgentId) {
+    result = await pollForSubagentResult(spawnedAgentId, requestStartTime);
+  } else {
+    // sessions_spawn doesn't appear in the SSE stream — scan all sub-agent dirs.
+    const found = await findAnySubagentResult(orchAgentId, requestStartTime);
+    if (found) { result = found.text; resolvedAgentId = found.agentId; }
+  }
+
+  if (!result) return;
+
+  // Fire a second orchestrator turn with the sub-agent result
+  const continuationInput = `[Subagent ${resolvedAgentId} completed its task. Result: "${result}" — please relay this to the user now.]`;
+
+  const headers: Record<string, string> = { ...gwHeaders, "Content-Type": "application/json" };
+  if (sessionKey) headers["x-openclaw-session-key"] = sessionKey;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const secondController = new AbortController();
+  const secondTimeout = setTimeout(() => secondController.abort(), 120_000);
+  try {
+    const secondRes = await fetch(`${gwUrl}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: `openclaw:${orchAgentId}`,
+        input: continuationInput,
+        stream: true,
+      }),
+      signal: secondController.signal,
+    });
+    if (secondRes.ok && secondRes.body) {
+      const secondReader = secondRes.body.getReader();
+      for await (const delta of parseOpenResponsesStream(secondReader)) {
+        ctrl.enqueue(encoder.encode(delta));
+      }
+    }
+  } catch { /* continuation failed — stream what we have */ }
+  finally {
+    clearTimeout(secondTimeout);
   }
 }
 
@@ -306,13 +603,29 @@ async function tryStreamingResponse(
   // Stream text deltas as plain text for TextStreamChatTransport
   const reader = gwRes.body.getReader();
   const encoder = new TextEncoder();
+  const requestStartTime = Date.now();
+  const spawnedAgentIds: string[] = [];
+  // Headers for sub-agent relay (without session-key — added per-request in autoRelaySubagentResult)
+  const baseHeaders: Record<string, string> = { "x-openclaw-agent-id": agentId };
 
   const stream = new ReadableStream({
     async start(ctrl) {
       try {
-        for await (const delta of parseOpenResponsesStream(reader)) {
+        for await (const delta of parseOpenResponsesStream(reader, {
+          onSpawn: (spawned) => spawnedAgentIds.push(spawned),
+        })) {
           ctrl.enqueue(encoder.encode(delta));
         }
+        // Auto-relay the sub-agent result when sessions_spawn was detected.
+        await autoRelaySubagentResult(ctrl, encoder, {
+          spawnedAgentId: spawnedAgentIds.length > 0 ? spawnedAgentIds[0] : null,
+          requestStartTime,
+          orchAgentId: agentId,
+          sessionKey,
+          gwUrl,
+          token,
+          gwHeaders: baseHeaders,
+        });
       } catch {
         // Stream interrupted — ok
       } finally {
